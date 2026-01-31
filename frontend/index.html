@@ -1,0 +1,483 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Ulta-WOW Traffic Optimizer</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; background: #0b0f1a; color: #e8eefc; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card { background: #121a2e; border: 1px solid #223055; border-radius: 14px; padding: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.25); }
+    .card h3 { margin: 0 0 8px 0; font-size: 16px; }
+    .controls { align-items: center; }
+    button, select, input { background: #1b2750; border: 1px solid #2b3a68; color: #e8eefc; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
+    button:hover { background: #25346a; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #2b3a68; }
+    .pill.green { background: rgba(45, 200, 90, 0.15); border-color: rgba(45, 200, 90, 0.35); }
+    .pill.red { background: rgba(220, 70, 70, 0.15); border-color: rgba(220, 70, 70, 0.35); }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; }
+    .metric { display: flex; justify-content: space-between; margin: 6px 0; font-size: 14px; }
+    .bar { height: 10px; border-radius: 10px; background: #223055; overflow: hidden; }
+    .bar > div { height: 100%; background: #6aa5ff; width: 0%; }
+    .small { font-size: 12px; color: #b6c4ee; }
+    .mapWrap { width: 420px; max-width: 100%; }
+    svg { width: 100%; height: auto; }
+    .node { fill: #182245; stroke: #2b3a68; stroke-width: 2; }
+    .road { stroke: #2b3a68; stroke-width: 10; stroke-linecap: round; opacity: 0.7; }
+    .light { fill: #a6b7e8; }
+    .light.green { fill: #2dd05a; }
+    .light.red { fill: #dc4646; }
+    .legend { display:flex; gap:8px; flex-wrap: wrap; margin-top: 8px;}
+    .splitTitle { display:flex; justify-content: space-between; align-items:center; margin-bottom: 8px;}
+    .reason { margin-top: 6px; padding: 8px; border-radius: 10px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); }
+
+    /* ===== Cross intersection viz styles ===== */
+    .intersectionViz { margin-top:10px; padding:10px; border-radius:12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); }
+    .roadFill { fill:#0e152c; stroke:#2b3a68; stroke-width:2; }
+    .laneMark { stroke:#2b3a68; stroke-width:2; stroke-dasharray:6 6; opacity:0.8; }
+    .stopLine { stroke:#e8eefc; stroke-width:3; opacity:0.35; }
+    .car { fill:#6aa5ff; rx:3; ry:3; }
+    .car.stop { fill:#9fb7ff; opacity:0.92; }
+    .car.moving { fill:#2dd05a; opacity:0.95; }
+    .car.emergency { fill: #ffd166; opacity: 0.98; }
+  </style>
+</head>
+
+<body>
+  <div style="position:fixed; bottom:10px; right:10px; background:#ff2d55; color:white; padding:6px 10px; border-radius:10px; z-index:999999;">
+  FRONTEND V2 LOADED
+</div>
+  <h2 style="margin:0 0 8px 0;">Ulta-WOW Smart City Traffic Optimizer</h2>
+
+  <div class="row controls card">
+    <button id="btnStart">Start</button>
+    <button id="btnPause">Pause</button>
+    <button id="btnReset">Reset</button>
+
+    <span class="small">Scenario</span>
+    <select id="scenario">
+      <option value="normal">Normal</option>
+      <option value="morning_peak">Morning Peak</option>
+      <option value="evening_peak">Evening Peak</option>
+      <option value="accident_eastbound">Accident (Eastbound bottleneck)</option>
+    </select>
+
+    <label class="small"><input type="checkbox" id="autoEvents" checked /> Auto Events</label>
+
+    <span class="small">Inject:</span>
+    <select id="injIntersection">
+      <option>A</option><option>B</option><option>C</option><option>D</option>
+    </select>
+
+    <button id="btnEmergency">Emergency (E)</button>
+    <button id="btnPed">Pedestrian (NS)</button>
+
+    <button id="btnCompare">Run Compare (5 min)</button>
+  </div>
+
+  <div class="row">
+    <div class="card mapWrap">
+      <h3>Mini City Map</h3>
+      <svg viewBox="0 0 520 260">
+        <!-- Roads -->
+        <line class="road" x1="60" y1="130" x2="460" y2="130" />
+        <!-- Nodes -->
+        <circle class="node" cx="120" cy="130" r="28" />
+        <circle class="node" cx="220" cy="130" r="28" />
+        <circle class="node" cx="320" cy="130" r="28" />
+        <circle class="node" cx="420" cy="130" r="28" />
+        <text x="112" y="136" fill="#e8eefc" font-size="14">A</text>
+        <text x="212" y="136" fill="#e8eefc" font-size="14">B</text>
+        <text x="312" y="136" fill="#e8eefc" font-size="14">C</text>
+        <text x="412" y="136" fill="#e8eefc" font-size="14">D</text>
+
+        <!-- Lights (two dots per node: NS and EW) -->
+        <circle id="A_NS" class="light" cx="120" cy="95" r="7"/><circle id="A_EW" class="light" cx="150" cy="130" r="7"/>
+        <circle id="B_NS" class="light" cx="220" cy="95" r="7"/><circle id="B_EW" class="light" cx="250" cy="130" r="7"/>
+        <circle id="C_NS" class="light" cx="320" cy="95" r="7"/><circle id="C_EW" class="light" cx="350" cy="130" r="7"/>
+        <circle id="D_NS" class="light" cx="420" cy="95" r="7"/><circle id="D_EW" class="light" cx="450" cy="130" r="7"/>
+      </svg>
+
+      <div class="legend small">
+        <span class="pill green">Green</span>
+        <span class="pill red">Red</span>
+        <span>NS dot is above node, EW dot is right of node</span>
+      </div>
+
+      <div class="small" id="statusLine" style="margin-top:8px;">Connecting…</div>
+    </div>
+
+    <div class="card" style="flex:1; min-width: 520px;">
+      <div class="grid2">
+        <div>
+          <div class="splitTitle">
+            <h3>Fixed Timing</h3>
+            <span class="pill red">baseline</span>
+          </div>
+          <div id="fixedIntersections"></div>
+          <div class="reason small" id="fixedNote"></div>
+        </div>
+
+        <div>
+          <div class="splitTitle">
+            <h3>Dynamic Optimizer</h3>
+            <span class="pill green">optimized</span>
+          </div>
+          <div id="dynIntersections"></div>
+          <div class="reason small" id="dynNote"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="flex:1; min-width: 520px;">
+      <h3>Live Metrics (Fixed vs Dynamic)</h3>
+      <div class="grid2">
+        <div id="chartQueue" style="height:240px;"></div>
+        <div id="chartWait" style="height:240px;"></div>
+        <div id="chartEmissions" style="height:240px;"></div>
+        <div class="card" style="background:#0f1730; border-color:#223055;">
+          <h3 style="margin-top:0;">Compare Result</h3>
+          <pre id="compareOut" class="small" style="white-space:pre-wrap; margin:0;"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const API = "http://localhost:8000";
+let timer = null;
+
+/* ---------- helpers ---------- */
+function qBar(label, value) {
+  const pct = Math.min(100, value * 4);
+  return `
+    <div class="metric"><span>${label}</span><span>${value}</span></div>
+    <div class="bar"><div style="width:${pct}%"></div></div>
+  `;
+}
+
+function hasEmergency(inter) {
+  return Object.values(inter.emergency || {}).some(v => v);
+}
+
+/* ---------- Cross intersection SVG with real car animation ---------- */
+function intersectionCrossSVG(inter, tag) {
+  const q = inter.queues;
+  const phase = inter.phase;
+  const inTrans = inter.in_transition;
+
+  const greenNS = (phase === "NS") && !inTrans;
+  const greenEW = (phase === "EW") && !inTrans;
+
+  // cap cars for UI
+  const cap = (n) => Math.max(0, Math.min(8, n));
+
+  const carsN = cap(q.N);
+  const carsS = cap(q.S);
+  const carsE = cap(q.E);
+  const carsW = cap(q.W);
+
+  // make 1 "emergency car" if emergency exists
+  const emer = hasEmergency(inter);
+
+  const carRects = [];
+
+  // Geometry constants
+  const spacing = 14;
+
+  // N cars move down
+  for (let i = 0; i < carsN; i++) {
+    const x = 106, y = 8 + i * spacing;
+    const cls = greenNS ? "car moving" : "car stop";
+    carRects.push(`<rect class="${cls}" width="10" height="12" x="${x}" y="${y}" data-dir="N" />`);
+  }
+
+  // S cars move up
+  for (let i = 0; i < carsS; i++) {
+    const x = 124, y = 200 - i * spacing;
+    const cls = greenNS ? "car moving" : "car stop";
+    carRects.push(`<rect class="${cls}" width="10" height="12" x="${x}" y="${y}" data-dir="S" />`);
+  }
+
+  // E cars move left
+  for (let i = 0; i < carsE; i++) {
+    const x = 200 - i * spacing, y = 124;
+    const cls = greenEW ? "car moving" : "car stop";
+    carRects.push(`<rect class="${cls}" width="12" height="10" x="${x}" y="${y}" data-dir="E" />`);
+  }
+
+  // W cars move right
+  for (let i = 0; i < carsW; i++) {
+    const x = 8 + i * spacing, y = 106;
+    const cls = greenEW ? "car moving" : "car stop";
+    carRects.push(`<rect class="${cls}" width="12" height="10" x="${x}" y="${y}" data-dir="W" />`);
+  }
+
+  // add an emergency vehicle (highlighted)
+  // place it in the approach that currently has emergency true if possible
+  if (emer) {
+    // choose a direction that has emergency flag = true
+    const dirs = ["N","S","E","W"].filter(d => inter.emergency && inter.emergency[d]);
+    const d = dirs.length ? dirs[0] : "E";
+
+    if (d === "N") carRects.push(`<rect class="car emergency moving" width="10" height="14" x="106" y="6" data-dir="N" />`);
+    if (d === "S") carRects.push(`<rect class="car emergency moving" width="10" height="14" x="124" y="200" data-dir="S" />`);
+    if (d === "E") carRects.push(`<rect class="car emergency moving" width="14" height="10" x="200" y="124" data-dir="E" />`);
+    if (d === "W") carRects.push(`<rect class="car emergency moving" width="14" height="10" x="6" y="106" data-dir="W" />`);
+  }
+
+  return `
+    <div class="intersectionViz" data-viz="${inter.id}_${tag}">
+      <div class="small">Cross view: cars stop on red, move on green</div>
+      <svg viewBox="0 0 220 220" width="100%" height="220" aria-label="intersection-cross-${inter.id}-${tag}">
+        <!-- roads -->
+        <rect class="roadFill" x="0" y="80" width="220" height="60" />
+        <rect class="roadFill" x="80" y="0" width="60" height="220" />
+
+        <!-- lane markings -->
+        <line class="laneMark" x1="110" y1="0" x2="110" y2="220"/>
+        <line class="laneMark" x1="0" y1="110" x2="220" y2="110"/>
+
+        <!-- stop lines -->
+        <line class="stopLine" x1="80" y1="78" x2="140" y2="78"/>
+        <line class="stopLine" x1="80" y1="142" x2="140" y2="142"/>
+        <line class="stopLine" x1="78" y1="80" x2="78" y2="140"/>
+        <line class="stopLine" x1="142" y1="80" x2="142" y2="140"/>
+
+        <!-- signal indicator -->
+        <text x="10" y="18" fill="#e8eefc" font-size="12">Phase: ${inter.phase}${inter.in_transition ? " (transition)" : ""}</text>
+        <text x="10" y="34" fill="#b6c4ee" font-size="11">NS: ${greenNS ? "GREEN" : "RED"} | EW: ${greenEW ? "GREEN" : "RED"}</text>
+
+        <!-- cars -->
+        ${carRects.join("")}
+      </svg>
+      <div class="small">Cars drawn are capped (max 8 per direction) for clarity.</div>
+    </div>
+  `;
+}
+
+function applyCarAnimations(svgEl, inter) {
+  const phase = inter.phase;
+  const inTrans = inter.in_transition;
+  const greenNS = (phase === "NS") && !inTrans;
+  const greenEW = (phase === "EW") && !inTrans;
+
+  // Only animate cars with "moving"
+  const cars = svgEl.querySelectorAll("rect.car.moving");
+  cars.forEach((car) => {
+    // clear old animation
+    car.querySelectorAll("animateTransform").forEach(a => a.remove());
+
+    const dir = car.getAttribute("data-dir");
+    let from = "0 0";
+    let to = "0 0";
+
+    // tuned distances for 220x220 viewBox
+    if (dir === "N" && greenNS) to = "0 120";
+    if (dir === "S" && greenNS) to = "0 -120";
+    if (dir === "E" && greenEW) to = "-120 0";
+    if (dir === "W" && greenEW) to = "120 0";
+
+    // emergency always moves (even if phase isn't green) — looks dramatic
+    const isEmergency = car.classList.contains("emergency");
+    if (isEmergency) {
+      if (dir === "N") to = "0 120";
+      if (dir === "S") to = "0 -120";
+      if (dir === "E") to = "-120 0";
+      if (dir === "W") to = "120 0";
+    }
+
+    // If it shouldn't move, don't animate
+    if (to === "0 0") return;
+
+    const anim = document.createElementNS("http://www.w3.org/2000/svg", "animateTransform");
+    anim.setAttribute("attributeName", "transform");
+    anim.setAttribute("type", "translate");
+    anim.setAttribute("from", from);
+    anim.setAttribute("to", to);
+    anim.setAttribute("dur", isEmergency ? "0.7s" : "1.0s");
+    anim.setAttribute("repeatCount", "indefinite");
+    car.appendChild(anim);
+  });
+}
+
+/* ---------- render intersection cards (with cross viz) ---------- */
+function renderIntersections(containerId, sim) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = "";
+
+  sim.intersections.forEach(inter => {
+    const q = inter.queues;
+    const phase = inter.phase;
+    const hs = inter.health_score;
+    const healthPill = hs >= 70 ? "pill green" : (hs >= 40 ? "pill" : "pill red");
+
+    const emer = hasEmergency(inter) ? "🚑" : "";
+    const ped = Object.values(inter.ped).some(v => v) ? "🚶" : "";
+
+    const card = document.createElement("div");
+    card.className = "card";
+    card.style.marginBottom = "10px";
+    card.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <b>Intersection ${inter.id}</b>
+        <span class="${healthPill}">health ${hs}</span>
+      </div>
+      <div class="small">Phase: <b>${phase}</b> | time left: ${inter.time_left}s ${inter.in_transition ? "(transition)" : ""} ${emer} ${ped}</div>
+      <div class="grid2" style="margin-top:8px;">
+        <div>${qBar("N queue", q.N)}</div>
+        <div>${qBar("S queue", q.S)}</div>
+        <div>${qBar("E queue", q.E)}</div>
+        <div>${qBar("W queue", q.W)}</div>
+      </div>
+      <div class="small" style="margin-top:6px;">Reason: ${inter.reason || "-"}</div>
+      ${intersectionCrossSVG(inter, containerId)}
+    `;
+    el.appendChild(card);
+  });
+
+  // Apply animations after DOM is created
+  const svgs = el.querySelectorAll(".intersectionViz svg");
+  sim.intersections.forEach((inter, idx) => {
+    const svg = svgs[idx];
+    if (svg) applyCarAnimations(svg, inter);
+  });
+}
+
+/* ---------- mini map lights ---------- */
+function setLightDots(sim) {
+  ["A","B","C","D"].forEach(id => {
+    ["NS","EW"].forEach(p => {
+      const dot = document.getElementById(`${id}_${p}`);
+      dot.classList.remove("green"); dot.classList.remove("red");
+      dot.classList.add("red");
+    });
+  });
+
+  sim.intersections.forEach(inter => {
+    const id = inter.id;
+    const phase = inter.phase;
+    const gdot = document.getElementById(`${id}_${phase}`);
+    const rdot = document.getElementById(`${id}_${phase === "NS" ? "EW":"NS"}`);
+    gdot.classList.remove("red"); gdot.classList.add("green");
+    rdot.classList.remove("green"); rdot.classList.add("red");
+  });
+}
+
+/* ---------- charts ---------- */
+function updateCharts(fixed, dyn) {
+  const tf = fixed.metrics.series.t;
+  const td = dyn.metrics.series.t;
+
+  Plotly.react("chartQueue", [
+    {x: tf, y: fixed.metrics.series.queue, name:"Fixed"},
+    {x: td, y: dyn.metrics.series.queue, name:"Dynamic"}
+  ], {title:"Total Queue (cars)", paper_bgcolor:"#121a2e", plot_bgcolor:"#121a2e", font:{color:"#e8eefc"}, margin:{l:40,r:10,t:40,b:30}});
+
+  Plotly.react("chartWait", [
+    {x: tf, y: fixed.metrics.series.avg_wait, name:"Fixed"},
+    {x: td, y: dyn.metrics.series.avg_wait, name:"Dynamic"}
+  ], {title:"Avg Wait (sec/vehicle)", paper_bgcolor:"#121a2e", plot_bgcolor:"#121a2e", font:{color:"#e8eefc"}, margin:{l:40,r:10,t:40,b:30}});
+
+  Plotly.react("chartEmissions", [
+    {x: tf, y: fixed.metrics.series.emissions, name:"Fixed"},
+    {x: td, y: dyn.metrics.series.emissions, name:"Dynamic"}
+  ], {title:"Emissions Proxy (g)", paper_bgcolor:"#121a2e", plot_bgcolor:"#121a2e", font:{color:"#e8eefc"}, margin:{l:40,r:10,t:40,b:30}});
+}
+
+/* ---------- API ---------- */
+async function api(method, path, body=null) {
+  const opts = { method, headers: {"Content-Type":"application/json"} };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${API}${path}`, opts);
+  return await res.json();
+}
+
+/* ---------- simulation tick ---------- */
+async function tickOnce() {
+  const data = await api("POST","/tick");
+  const fixed = data.fixed, dyn = data.dynamic;
+
+  document.getElementById("statusLine").textContent = `t=${dyn.t}s | scenario=${dyn.scenario} | running=${data.running}`;
+
+  renderIntersections("fixedIntersections", fixed);
+  renderIntersections("dynIntersections", dyn);
+
+  setLightDots(dyn);
+  updateCharts(fixed, dyn);
+
+  document.getElementById("fixedNote").textContent =
+    `Vehicles served: ${fixed.metrics.vehicles_served} | Avg wait: ${fixed.metrics.avg_wait}s | Emissions: ${fixed.metrics.emissions_g}g`;
+
+  document.getElementById("dynNote").textContent =
+    `Vehicles served: ${dyn.metrics.vehicles_served} | Avg wait: ${dyn.metrics.avg_wait}s | Emissions: ${dyn.metrics.emissions_g}g`;
+}
+
+function startLoop() {
+  if (timer) return;
+  timer = setInterval(tickOnce, 1000);
+}
+function stopLoop() {
+  if (!timer) return;
+  clearInterval(timer);
+  timer = null;
+}
+
+/* ---------- button wiring ---------- */
+document.getElementById("btnStart").onclick = async () => {
+  await api("POST","/control",{running:true});
+  startLoop();
+};
+
+document.getElementById("btnPause").onclick = async () => {
+  await api("POST","/control",{running:false});
+  stopLoop();
+  await tickOnce();
+};
+
+document.getElementById("btnReset").onclick = async () => {
+  await api("POST","/control",{seed: 42});
+  await tickOnce();
+};
+
+document.getElementById("scenario").onchange = async (e) => {
+  await api("POST","/control",{scenario: e.target.value});
+  await tickOnce();
+};
+
+document.getElementById("autoEvents").onchange = async (e) => {
+  await api("POST","/control",{auto_events: e.target.checked});
+};
+
+document.getElementById("btnEmergency").onclick = async () => {
+  const iid = document.getElementById("injIntersection").value;
+  await api("POST","/inject",{intersection_id: iid, kind:"emergency", where:"E"});
+  await tickOnce();
+};
+
+document.getElementById("btnPed").onclick = async () => {
+  const iid = document.getElementById("injIntersection").value;
+  await api("POST","/inject",{intersection_id: iid, kind:"ped", where:"NS"});
+  await tickOnce();
+};
+
+document.getElementById("btnCompare").onclick = async () => {
+  const out = await api("GET","/compare?steps=300");
+  document.getElementById("compareOut").textContent = JSON.stringify(out, null, 2);
+};
+
+/* ---------- initial paint ---------- */
+(async () => {
+  try {
+    await api("GET","/health");
+    await tickOnce();
+  } catch(e) {
+    document.getElementById("statusLine").textContent =
+      "Backend not running. Start: python -m uvicorn app:app --reload --port 8000";
+  }
+})();
+</script>
+</body>
+</html>
