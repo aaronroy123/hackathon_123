@@ -25,8 +25,8 @@ class ControlRequest(BaseModel):
 
 class InjectRequest(BaseModel):
     intersection_id: str
-    kind: str   # "emergency" | "ped"
-    where: str  # emergency: N/S/E/W ; ped: NS/EW
+    kind: str  # "emergency" | "ped"
+    where: str # emergency: N/S/E/W ; ped: NS/EW
 
 @app.get("/health")
 def health():
@@ -42,7 +42,6 @@ def control(req: ControlRequest):
         city.set_auto_events(req.auto_events)
     if req.running is not None:
         city.set_running(req.running)
-
     return {
         "running": city.running,
         "scenario": city.scenario,
@@ -52,16 +51,13 @@ def control(req: ControlRequest):
 
 @app.post("/inject")
 def inject(req: InjectRequest):
-    city.inject_event_both(req.intersection_id, req.kind, req.where)
+    # ✅ IMPORTANT: emergency/ped should affect ONLY dynamic mode
+    city.dynamic.inject_event(req.intersection_id, req.kind, req.where)
     return {"ok": True}
 
 @app.get("/state")
 def state():
-    return {
-        "running": city.running,
-        "fixed": city.fixed.snapshot(),
-        "dynamic": city.dynamic.snapshot()
-    }
+    return {"running": city.running, "fixed": city.fixed.snapshot(), "dynamic": city.dynamic.snapshot()}
 
 @app.post("/tick")
 def tick():

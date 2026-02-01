@@ -8,6 +8,7 @@
     .top { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
     button, select, input { background:#1b2750; border:1px solid #2b3a68; color:#e8eefc; padding:8px 10px; border-radius:10px; cursor:pointer; }
     button:hover { background:#25346a; }
+    button:disabled { opacity:0.45; cursor:not-allowed; }
     .card { background:#121a2e; border:1px solid #223055; border-radius:14px; padding:12px; box-shadow:0 6px 20px rgba(0,0,0,0.25); }
     .row { display:flex; gap:12px; flex-wrap:wrap; }
     .small { font-size:12px; color:#b6c4ee; }
@@ -49,15 +50,7 @@
 
     <label class="small"><input type="checkbox" id="autoEvents" checked/> Auto Events</label>
 
-    <span class="small">Inject at:</span>
-    <select id="injWhere">
-      <option value="N">North</option>
-      <option value="S">South</option>
-      <option value="E">East</option>
-      <option value="W">West</option>
-    </select>
-
-    <button id="btnEmergency">Emergency</button>
+    <button id="btnEmergency">Emergency (Alt NS/EW)</button>
     <button id="btnPedNS">Pedestrian (NS)</button>
     <button id="btnPedEW">Pedestrian (EW)</button>
 
@@ -119,26 +112,35 @@ window.addEventListener("resize", resizeCanvasToDisplaySize);
 resizeCanvasToDisplaySize();
 
 /* =========================================================
-   Visual simulation state (frontend-only)
+   Visual simulation state (LEFT LANE ONLY)
 ========================================================= */
 const VIS = {
   inter: null,
-  cars: { N: [], S: [], E: [], W: [] },
+  cars: { N: [], S: [], E: [], W: [] }, // each dir contains both waiting + leaving cars
   lastTs: performance.now(),
-  maxCarsPerDir: 30,
+  maxCarsPerDir: 80,
 
-  spacing: 32,
-  followSpeed: 260,
-  passAdvance: 30,
-
+  spacing: 36,
   carLen: 30,
   carWid: 16,
 
+  followSpeed: 340,
+  passSpeed: 520,  // speed when leaving through the junction
+  passAdvance: 44,
+
   flowOffset: { N:0, S:0, E:0, W:0 },
 
+  nextId: 1,
+
+  // track last backend queue to detect "served" drops
+  lastBackendQ: { N:0, S:0, E:0, W:0 },
+
   emergency: {
-    activeDir: null,      // "N"|"S"|"E"|"W"|null
-    allRedUntilMs: 0,
+    active: false,
+    axis: null,
+    untilMs: 0,
+    nextAxis: "NS",
+    amb: null
   }
 };
 
@@ -149,84 +151,8 @@ function pickCarColor() {
   return colors[Math.floor(Math.random()*colors.length)];
 }
 
-function makeCar(dir, lane) {
-  return { dir, lane, x:0, y:0, color: pickCarColor() };
-}
-
 /* =========================================================
-   Emergency detection (from backend)
-========================================================= */
-function getEmergencyDir(inter){
-  if (!inter || !inter.emergency) return null;
-  for (const k of Object.keys(inter.emergency)) {
-    if (inter.emergency[k]) return k;
-  }
-  return null;
-}
-
-function emergencyAxis(dir){
-  if (!dir) return null;
-  return (dir === "N" || dir === "S") ? "NS" : "EW";
-}
-
-/* =========================================================
-   Traffic light state: green / yellow / red + emergency override
-========================================================= */
-function baseLightStateForAxis(axis, inter){
-  if (!inter) return "red";
-
-  if (!inter.in_transition) {
-    return (inter.phase === axis) ? "green" : "red";
-  }
-
-  const tr = Number(inter.transition_left ?? 0);
-  if (tr > ALL_RED_SEC) return "yellow";
-  return "red";
-}
-
-/**
- * Emergency override:
- * - Emergency start -> show ALL RED for ALL_RED_SEC (visual clearance)
- * - Then show GREEN only on emergency axis, other axis RED
- * - If backend is still in_transition, keep RED (smoother & accurate)
- */
-function lightStateForAxis(axis, inter){
-  const now = performance.now();
-  const edir = VIS.emergency.activeDir;
-
-  if (edir) {
-    if (!inter) return "red";
-
-    // if backend is still transitioning, stay red
-    if (inter.in_transition) return "red";
-
-    // clearance all-red window
-    if (now < VIS.emergency.allRedUntilMs) return "red";
-
-    // after clearance: only emergency axis green
-    const eAxis = emergencyAxis(edir);
-    return (axis === eAxis) ? "green" : "red";
-  }
-
-  return baseLightStateForAxis(axis, inter);
-}
-
-function isGreen(dir, inter) {
-  if (VIS.emergency.activeDir) {
-    const axis = emergencyAxis(VIS.emergency.activeDir);
-    return (axis === "NS" && (dir === "N" || dir === "S")) ||
-           (axis === "EW" && (dir === "E" || dir === "W"));
-  }
-
-  if (!inter) return false;
-  if (inter.in_transition) return false;
-  if ((dir === "N" || dir === "S") && inter.phase === "NS") return true;
-  if ((dir === "E" || dir === "W") && inter.phase === "EW") return true;
-  return false;
-}
-
-/* =========================================================
-   Road geometry (lane centers prevent overlap)
+   Road geometry + LEFT LANE rule
 ========================================================= */
 function roadGeom(){
   const W = canvas.width, H = canvas.height;
@@ -237,12 +163,29 @@ function roadGeom(){
   return {W,H,cx,cy,roadW,laneSep,stopDist};
 }
 
+/**
+ * ✅ LEFT lane rule relative to direction of travel
+ */
 function laneCenter(dir, lane){
   const {cx,cy,laneSep} = roadGeom();
-  const s = (lane === 0 ? -laneSep : +laneSep);
+  const left = (lane === 0);
 
-  if (dir === "N" || dir === "S") return { x: cx + s, y: null };
-  if (dir === "E" || dir === "W") return { x: null, y: cy + s };
+  if (dir === "N") { // moving down, left is +x
+    const s = left ? +laneSep : -laneSep;
+    return { x: cx + s, y: null };
+  }
+  if (dir === "S") { // moving up, left is -x
+    const s = left ? -laneSep : +laneSep;
+    return { x: cx + s, y: null };
+  }
+  if (dir === "E") { // moving left, left is +y
+    const s = left ? +laneSep : -laneSep;
+    return { x: null, y: cy + s };
+  }
+  if (dir === "W") { // moving right, left is -y
+    const s = left ? -laneSep : +laneSep;
+    return { x: null, y: cy + s };
+  }
   return {x:cx,y:cy};
 }
 
@@ -256,48 +199,171 @@ function stopLine(dir, lane) {
   return { x: cx - stopDist, y: lc.y };
 }
 
-function placeCarAtBack(car, dir, indexInLane) {
+function exitPoint(dir){
   const {W,H,cx,cy} = roadGeom();
-  const s = VIS.spacing;
-  const far = 0.48;
+  const farX = W*0.60, farY = H*0.60;
+  const lane = 0;
 
-  if (dir === "N") { car.x = laneCenter(dir, car.lane).x; car.y = (cy - H*far) + indexInLane*s; }
-  if (dir === "S") { car.x = laneCenter(dir, car.lane).x; car.y = (cy + H*far) - indexInLane*s; }
-  if (dir === "E") { car.y = laneCenter(dir, car.lane).y; car.x = (cx + W*far) - indexInLane*s; }
-  if (dir === "W") { car.y = laneCenter(dir, car.lane).y; car.x = (cx - W*far) + indexInLane*s; }
+  if (dir === "N") return { x: laneCenter("N", lane).x, y: cy + farY };
+  if (dir === "S") return { x: laneCenter("S", lane).x, y: cy - farY };
+  if (dir === "E") return { x: cx - farX, y: laneCenter("E", lane).y };
+  return { x: cx + farX, y: laneCenter("W", lane).y };
+}
+
+function placeCarAtBack(car) {
+  const {W,H,cx,cy} = roadGeom();
+  const far = 0.56;
+
+  const i = car.laneIndex;
+  const s = VIS.spacing;
+
+  if (car.dir === "N") { car.x = laneCenter("N", car.lane).x; car.y = (cy - H*far) + i*s; }
+  if (car.dir === "S") { car.x = laneCenter("S", car.lane).x; car.y = (cy + H*far) - i*s; }
+  if (car.dir === "E") { car.y = laneCenter("E", car.lane).y; car.x = (cx + W*far) - i*s; }
+  if (car.dir === "W") { car.y = laneCenter("W", car.lane).y; car.x = (cx - W*far) + i*s; }
 }
 
 /* =========================================================
-   Reconcile cars with backend queues
+   Emergency visuals (unchanged)
 ========================================================= */
+function beginEmergency(axis){
+  VIS.emergency.active = true;
+  VIS.emergency.axis = axis;
+  VIS.emergency.untilMs = performance.now() + 5200;
+
+  const {W,H,cx,cy} = roadGeom();
+  const farX = W*0.52, farY = H*0.52;
+
+  let dir;
+  if (axis === "NS") dir = (Math.random() < 0.5) ? "N" : "S";
+  else dir = (Math.random() < 0.5) ? "W" : "E";
+
+  const lane = 0;
+  const amb = { type:"ambulance", dir, lane, x:cx, y:cy };
+
+  if (dir === "N") { amb.x = laneCenter("N", lane).x; amb.y = cy - farY; }
+  if (dir === "S") { amb.x = laneCenter("S", lane).x; amb.y = cy + farY; }
+  if (dir === "E") { amb.y = laneCenter("E", lane).y; amb.x = cx + farX; }
+  if (dir === "W") { amb.y = laneCenter("W", lane).y; amb.x = cx - farX; }
+
+  VIS.emergency.amb = amb;
+}
+function endEmergency(){
+  VIS.emergency.active = false;
+  VIS.emergency.axis = null;
+  VIS.emergency.untilMs = 0;
+  VIS.emergency.amb = null;
+}
+
+/* =========================================================
+   Lights (unchanged)
+========================================================= */
+function baseLightStateForAxis(axis, inter){
+  if (!inter) return "red";
+  if (!inter.in_transition) return (inter.phase === axis) ? "green" : "red";
+  const tr = Number(inter.transition_left ?? 0);
+  if (tr > ALL_RED_SEC) return "yellow";
+  return "red";
+}
+function lightStateForAxis(axis, inter){
+  if (VIS.emergency.active) return "red";
+  return baseLightStateForAxis(axis, inter);
+}
+function isGreen(dir, inter) {
+  if (VIS.emergency.active) return false;
+  if (!inter) return false;
+  if (inter.in_transition) return false;
+  if ((dir === "N" || dir === "S") && inter.phase === "NS") return true;
+  if ((dir === "E" || dir === "W") && inter.phase === "EW") return true;
+  return false;
+}
+
+/* =========================================================
+   ✅ Cars: WAITING then LEAVING (so no mid-disappear)
+========================================================= */
+function makeCar(dir, laneIndex) {
+  return {
+    type: "car",
+    id: VIS.nextId++,
+    dir,
+    lane: 0,               // left lane only
+    laneIndex,             // index among WAITING cars only
+    state: "waiting",      // "waiting" | "leaving"
+    tx: null, ty: null,    // used for leaving target
+    x: 0, y: 0,
+    color: pickCarColor()
+  };
+}
+
+function waitingCars(dir){
+  return VIS.cars[dir].filter(c => c.type === "car" && c.state === "waiting");
+}
+function leavingCars(dir){
+  return VIS.cars[dir].filter(c => c.type === "car" && c.state === "leaving");
+}
+
+function markFrontCarLeaving(dir){
+  // pick the front WAITING car (laneIndex 0)
+  const w = waitingCars(dir).sort((a,b)=>a.laneIndex - b.laneIndex);
+  if (w.length === 0) return;
+
+  const c = w[0];
+  c.state = "leaving";
+  const ex = exitPoint(dir);
+  c.tx = ex.x;
+  c.ty = ex.y;
+
+  // After removing the front one from "waiting", we must reindex the remaining waiting cars
+  const rest = waitingCars(dir).filter(x => x.id !== c.id).sort((a,b)=>a.laneIndex-b.laneIndex);
+  for (let i=0;i<rest.length;i++) rest[i].laneIndex = i;
+}
+
 function reconcileCars(inter) {
   if (!inter) return;
+
   const q = inter.queues;
 
   ["N","S","E","W"].forEach(dir => {
     const target = clamp(q[dir], 0, VIS.maxCarsPerDir);
-    const arr = VIS.cars[dir];
 
-    while (arr.length < target) {
-      const lane = (arr.length % 2);
-      const c = makeCar(dir, lane);
-      const idxLane = Math.floor(arr.length / 2);
-      placeCarAtBack(c, dir, idxLane);
-      arr.push(c);
+    const lastQ = VIS.lastBackendQ[dir] ?? 0;
+
+    // detect served drops (queue decreased)
+    const drops = Math.max(0, lastQ - target);
+
+    // for each served car: mark a FRONT car as leaving (do not delete)
+    for (let k=0;k<drops;k++) markFrontCarLeaving(dir);
+
+    // current waiting count after serving
+    let wCount = waitingCars(dir).length;
+
+    // if waiting < target, add new cars at the BACK
+    while (wCount < target) {
+      const c = makeCar(dir, wCount);
+      placeCarAtBack(c);
+      VIS.cars[dir].push(c);
+      wCount++;
     }
 
-    while (arr.length > target) arr.pop();
+    // if waiting > target (rare, e.g. reset), mark extras leaving from front
+    while (wCount > target) {
+      markFrontCarLeaving(dir);
+      wCount = waitingCars(dir).length;
+    }
+
+    // store last backend queue
+    VIS.lastBackendQ[dir] = target;
   });
 }
 
 /* =========================================================
-   Movement
+   Movement with anti-overlap clamp (WAITING only)
+   LEAVING cars go through to exit and disappear there
 ========================================================= */
 function updateFlowOffset(dt, inter) {
   ["N","S","E","W"].forEach(dir => {
-    if (isGreen(dir, inter)) {
-      VIS.flowOffset[dir] += VIS.passAdvance * dt;
-    } else {
+    if (isGreen(dir, inter)) VIS.flowOffset[dir] += VIS.passAdvance * dt;
+    else {
       VIS.flowOffset[dir] *= 0.80;
       if (Math.abs(VIS.flowOffset[dir]) < 0.3) VIS.flowOffset[dir] = 0;
     }
@@ -305,15 +371,17 @@ function updateFlowOffset(dt, inter) {
   });
 }
 
-function targetPosition(dir, lane, orderInLane) {
+function targetPositionWaiting(dir, laneIndex) {
+  const lane = 0;
   const stop = stopLine(dir, lane);
   let tx = stop.x, ty = stop.y;
+
   const off = VIS.flowOffset[dir];
 
-  if (dir === "N") { ty -= orderInLane * VIS.spacing; ty += off; }
-  if (dir === "S") { ty += orderInLane * VIS.spacing; ty -= off; }
-  if (dir === "E") { tx += orderInLane * VIS.spacing; tx -= off; }
-  if (dir === "W") { tx -= orderInLane * VIS.spacing; tx += off; }
+  if (dir === "N") { ty -= laneIndex * VIS.spacing; ty += off; }
+  if (dir === "S") { ty += laneIndex * VIS.spacing; ty -= off; }
+  if (dir === "E") { tx += laneIndex * VIS.spacing; tx -= off; }
+  if (dir === "W") { tx -= laneIndex * VIS.spacing; tx += off; }
 
   return {tx, ty};
 }
@@ -327,34 +395,87 @@ function moveToward(car, tx, ty, speed, dt) {
   car.y += (dy/d) * step;
 }
 
+// along travel axis (for clamp)
+function axisPos(dir, car){
+  if (dir === "N") return car.y;
+  if (dir === "S") return -car.y;
+  if (dir === "E") return -car.x;
+  return car.x;
+}
+
 function updateCars(dt, inter) {
   if (!inter) return;
 
   updateFlowOffset(dt, inter);
 
+  // WAITING cars: move to slots, then clamp no overlap
   ["N","S","E","W"].forEach(dir => {
-    const lane0 = VIS.cars[dir].filter(c => c.lane === 0);
-    const lane1 = VIS.cars[dir].filter(c => c.lane === 1);
+    const w = waitingCars(dir).slice().sort((a,b)=>a.laneIndex-b.laneIndex);
 
-    const stop0 = stopLine(dir, 0);
-    const stop1 = stopLine(dir, 1);
-
-    lane0.sort((a,b)=>Math.hypot(a.x-stop0.x,a.y-stop0.y)-Math.hypot(b.x-stop0.x,b.y-stop0.y));
-    lane1.sort((a,b)=>Math.hypot(a.x-stop1.x,a.y-stop1.y)-Math.hypot(b.x-stop1.x,b.y-stop1.y));
-
-    for (let i=0;i<lane0.length;i++){
-      const {tx,ty} = targetPosition(dir, 0, i);
-      moveToward(lane0[i], tx, ty, VIS.followSpeed, dt);
+    for (const c of w) {
+      const {tx,ty} = targetPositionWaiting(dir, c.laneIndex);
+      moveToward(c, tx, ty, VIS.followSpeed, dt);
     }
-    for (let i=0;i<lane1.length;i++){
-      const {tx,ty} = targetPosition(dir, 1, i);
-      moveToward(lane1[i], tx, ty, VIS.followSpeed, dt);
+
+    // anti-overlap clamp for WAITING cars
+    const minGap = VIS.spacing * 0.92;
+    for (let i=1;i<w.length;i++){
+      const front = w[i-1];
+      const back  = w[i];
+
+      const frontP = axisPos(dir, front);
+      const backP  = axisPos(dir, back);
+
+      if (backP > frontP - minGap) {
+        const fix = backP - (frontP - minGap);
+
+        if (dir === "N") back.y -= fix;
+        if (dir === "S") back.y += fix;
+        if (dir === "E") back.x += fix;
+        if (dir === "W") back.x -= fix;
+      }
+    }
+
+    // LEAVING cars: drive through to exit, then delete only at the far end
+    const lv = leavingCars(dir);
+    for (const c of lv) {
+      if (c.tx == null || c.ty == null) {
+        const ex = exitPoint(dir);
+        c.tx = ex.x; c.ty = ex.y;
+      }
+      moveToward(c, c.tx, c.ty, VIS.passSpeed * (canvas.width/1000), dt);
+
+      // remove only when it reaches the far end (NOT middle)
+      if (Math.hypot(c.x - c.tx, c.y - c.ty) < 10) {
+        VIS.cars[dir] = VIS.cars[dir].filter(x => x.id !== c.id);
+      }
     }
   });
+
+  // ambulance movement (unchanged)
+  if (VIS.emergency.active && VIS.emergency.amb) {
+    const amb = VIS.emergency.amb;
+    const speed = 560 * (canvas.width/1000);
+
+    const {W,H,cx,cy} = roadGeom();
+    const farX = W*0.55, farY = H*0.55;
+
+    let tx = amb.x, ty = amb.y;
+    if (amb.dir === "N") { ty = cy + farY; }
+    if (amb.dir === "S") { ty = cy - farY; }
+    if (amb.dir === "E") { tx = cx - farX; }
+    if (amb.dir === "W") { tx = cx + farX; }
+
+    moveToward(amb, tx, ty, speed, dt);
+
+    if (Math.hypot(amb.x-tx, amb.y-ty) < 8) endEmergency();
+  }
+
+  if (VIS.emergency.active && performance.now() > VIS.emergency.untilMs) endEmergency();
 }
 
 /* =========================================================
-   Drawing
+   Drawing (unchanged)
 ========================================================= */
 function roundRect(c, x, y, w, h, r) {
   c.beginPath();
@@ -419,7 +540,6 @@ function drawLights(inter) {
     if (state === "yellow") return "#ffd166";
     return "#dc4646";
   }
-
   function bulb(x,y,state){
     ctx.fillStyle = colorFor(state);
     ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill();
@@ -432,38 +552,33 @@ function drawLights(inter) {
   bulb(cx + stopDist*0.72, cy, ewState);
   bulb(cx - stopDist*0.72, cy, ewState);
 
-  const edir = VIS.emergency.activeDir;
   ctx.fillStyle="#e8eefc";
   ctx.font = `${Math.floor(16*(canvas.width/1000))}px system-ui`;
-
-  if (edir) {
-    ctx.fillText(`EMERGENCY ${edir} | Override active`, 18, 30);
-  } else {
-    ctx.fillText(`NS: ${nsState.toUpperCase()}  |  EW: ${ewState.toUpperCase()}`, 18, 30);
-  }
+  if (VIS.emergency.active) ctx.fillText(`EMERGENCY ACTIVE (ALL RED)`, 18, 30);
+  else ctx.fillText(`NS: ${nsState.toUpperCase()} | EW: ${ewState.toUpperCase()}`, 18, 30);
 }
 
-function drawCarSprite(car, emergencyDir) {
+function drawVehicleSprite(v) {
   const w = VIS.carLen * (canvas.width/1000);
   const h = VIS.carWid * (canvas.width/1000);
 
   let ang = 0;
-  if (car.dir === "N") ang = Math.PI/2;
-  if (car.dir === "S") ang = -Math.PI/2;
-  if (car.dir === "E") ang = Math.PI;
-  if (car.dir === "W") ang = 0;
-
-  const isEmer = (emergencyDir === car.dir);
+  if (v.dir === "N") ang = Math.PI/2;
+  if (v.dir === "S") ang = -Math.PI/2;
+  if (v.dir === "E") ang = Math.PI;
+  if (v.dir === "W") ang = 0;
 
   ctx.save();
-  ctx.translate(car.x, car.y);
+  ctx.translate(v.x, v.y);
   ctx.rotate(ang);
 
   ctx.fillStyle = "rgba(0,0,0,0.25)";
   roundRect(ctx, -w/2+2, -h/2+2, w, h, 5);
   ctx.fill();
 
-  ctx.fillStyle = isEmer ? "#ffd166" : car.color;
+  if (v.type === "ambulance") ctx.fillStyle = "#6b0f1a";
+  else ctx.fillStyle = v.color;
+
   roundRect(ctx, -w/2, -h/2, w, h, 5);
   ctx.fill();
 
@@ -471,14 +586,20 @@ function drawCarSprite(car, emergencyDir) {
   roundRect(ctx, -w/2+6, -h/2+3, w-12, h-6, 3);
   ctx.fill();
 
+  if (v.type === "ambulance") {
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    roundRect(ctx, -w/2+6, -2, w-12, 4, 2);
+    ctx.fill();
+  }
+
   ctx.restore();
 }
 
-function drawCars(inter) {
-  const emergencyDir = getEmergencyDir(inter);
+function drawCars() {
   ["N","S","E","W"].forEach(dir => {
-    for (const car of VIS.cars[dir]) drawCarSprite(car, emergencyDir);
+    for (const car of VIS.cars[dir]) drawVehicleSprite(car);
   });
+  if (VIS.emergency.active && VIS.emergency.amb) drawVehicleSprite(VIS.emergency.amb);
 }
 
 function renderFrame(ts) {
@@ -490,39 +611,32 @@ function renderFrame(ts) {
   if (VIS.inter) {
     updateCars(dt, VIS.inter);
     drawLights(VIS.inter);
-    drawCars(VIS.inter);
+    drawCars();
   }
   requestAnimationFrame(renderFrame);
 }
 requestAnimationFrame(renderFrame);
 
 function updateFromBackend(intersectionSnapshot) {
-  const newDir = getEmergencyDir(intersectionSnapshot);
-  const oldDir = VIS.emergency.activeDir;
-
-  if (newDir && !oldDir) {
-    VIS.emergency.activeDir = newDir;
-    VIS.emergency.allRedUntilMs = performance.now() + (ALL_RED_SEC * 1000);
-  } else if (!newDir && oldDir) {
-    VIS.emergency.activeDir = null;
-    VIS.emergency.allRedUntilMs = 0;
-  } else if (newDir && oldDir && newDir !== oldDir) {
-    VIS.emergency.activeDir = newDir;
-    VIS.emergency.allRedUntilMs = performance.now() + (ALL_RED_SEC * 1000);
-  }
-
   VIS.inter = intersectionSnapshot;
   reconcileCars(VIS.inter);
 }
 
 /* =========================================================
-   API + UI
+   API + UI (unchanged)
 ========================================================= */
 async function api(method, path, body=null) {
   const opts = { method, headers: {"Content-Type":"application/json"} };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${API}${path}`, opts);
   return await res.json();
+}
+
+function setButtonsForMode(){
+  const dyn = (currentMode === "dynamic");
+  document.getElementById("btnEmergency").disabled = !dyn;
+  document.getElementById("btnPedNS").disabled = !dyn;
+  document.getElementById("btnPedEW").disabled = !dyn;
 }
 
 async function tickOnce() {
@@ -544,13 +658,13 @@ async function tickOnce() {
 
   document.getElementById("reasonLine").textContent = `Reason: ${A.reason || "-"}`;
 
-  // ✅ safer queue access
-  document.getElementById("qN").textContent = `N-IN: ${q["N"]}`;
-  document.getElementById("qS").textContent = `S-IN: ${q["S"]}`;
-  document.getElementById("qE").textContent = `E-IN: ${q["E"]}`;
-  document.getElementById("qW").textContent = `W-IN: ${q["W"]}`;
+  document.getElementById("qN").textContent = `N-IN: ${q.N}`;
+  document.getElementById("qS").textContent = `S-IN: ${q.S}`;
+  document.getElementById("qE").textContent = `E-IN: ${q.E}`;
+  document.getElementById("qW").textContent = `W-IN: ${q.W}`;
 
   updateFromBackend(A);
+  setButtonsForMode();
 }
 
 function startLoop() {
@@ -576,16 +690,23 @@ document.getElementById("btnPause").onclick = async () => {
 
 document.getElementById("btnReset").onclick = async () => {
   await api("POST","/control",{seed: 42});
+  endEmergency();
+  VIS.lastBackendQ = {N:0,S:0,E:0,W:0};
+  VIS.cars = {N:[],S:[],E:[],W:[]};
   await tickOnce();
 };
 
 document.getElementById("mode").onchange = async (e) => {
   currentMode = e.target.value;
+  endEmergency();
   await tickOnce();
 };
 
 document.getElementById("scenario").onchange = async (e) => {
   await api("POST","/control",{scenario: e.target.value});
+  endEmergency();
+  VIS.lastBackendQ = {N:0,S:0,E:0,W:0};
+  VIS.cars = {N:[],S:[],E:[],W:[]};
   await tickOnce();
 };
 
@@ -594,22 +715,30 @@ document.getElementById("autoEvents").onchange = async (e) => {
 };
 
 document.getElementById("btnEmergency").onclick = async () => {
-  const where = document.getElementById("injWhere").value;
+  if (currentMode !== "dynamic") return;
+
+  const axis = VIS.emergency.nextAxis;
+  VIS.emergency.nextAxis = (axis === "NS") ? "EW" : "NS";
+
+  const where = (axis === "NS") ? "N" : "E";
   await api("POST","/inject",{intersection_id:"A", kind:"emergency", where});
+
+  beginEmergency(axis);
   await tickOnce();
 };
 
 document.getElementById("btnPedNS").onclick = async () => {
+  if (currentMode !== "dynamic") return;
   await api("POST","/inject",{intersection_id:"A", kind:"ped", where:"NS"});
   await tickOnce();
 };
 
 document.getElementById("btnPedEW").onclick = async () => {
+  if (currentMode !== "dynamic") return;
   await api("POST","/inject",{intersection_id:"A", kind:"ped", where:"EW"});
   await tickOnce();
 };
 
-// initial paint
 (async () => {
   try {
     await api("GET","/health");
