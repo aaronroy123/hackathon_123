@@ -1,47 +1,74 @@
+# simulator.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 import numpy as np
 
 from config import (
-    SIM_DT, CONTROL_INTERVAL, MIN_GREEN, MAX_GREEN, YELLOW, ALL_RED,
-    PED_MIN, SERVICE_RATE, SCENARIOS
+    SIM_DT,
+    CONTROL_INTERVAL,
+    MIN_GREEN,
+    MAX_GREEN,
+    YELLOW,
+    ALL_RED,
+    SERVICE_RATE,
+    SCENARIOS,
 )
 from metrics import Metrics
 from optimizer import choose_phase
 
-PHASE_SERVES = {"NS": ["N","S"], "EW": ["E","W"]}
+PHASE_SERVES = {"NS": ["N", "S"], "EW": ["E", "W"]}
+
 
 @dataclass
 class LightState:
     phase: str = "NS"
     time_left: int = MIN_GREEN
+
+    # transition = yellow + all-red window while switching
     in_transition: bool = False
     transition_left: int = 0
     next_phase: Optional[str] = None
 
+    # emergency mode: we are currently in a special preempted green
+    emergency_mode: bool = False
+
+
 class Intersection:
-    def __init__(self, iid: str, arrival_rates: Dict[str,float]):
+    def __init__(self, iid: str, arrival_rates: Dict[str, float]):
         self.id = iid
-        self.queues: Dict[str,int] = {"N":0,"S":0,"E":0,"W":0}
+        self.queues: Dict[str, int] = {"N": 0, "S": 0, "E": 0, "W": 0}
         self.arrival_rate = dict(arrival_rates)
-        self.emergency: Dict[str,bool] = {a: False for a in self.queues}
-        self.ped: Dict[str,bool] = {a: False for a in self.queues}
+
+        self.emergency: Dict[str, bool] = {a: False for a in self.queues}
+        self.ped: Dict[str, bool] = {a: False for a in self.queues}
+
         self.light = LightState()
         self.last_decision_reason = ""
 
         # capacity modifier (for accident scenario)
         self.capacity_mult = 1.0
 
-    def snapshot(self):
-        # congestion/health score: 100 is best, 0 is worst
+    def snapshot(self) -> Dict:
         total_q = sum(self.queues.values())
-        score = max(0, 100 - int(total_q * 3))  # simple mapping
+        score = max(0, 100 - int(total_q * 3))
+
         return {
             "id": self.id,
             "phase": self.light.phase,
             "time_left": self.light.time_left,
             "in_transition": self.light.in_transition,
+
+            # ✅ REQUIRED for yellow rendering on frontend
+            "transition_left": self.light.transition_left,
+
+            # optional, helpful for debugging
+            "next_phase": self.light.next_phase,
+
+            # optional, helpful for UI/debug (frontend can ignore)
+            "emergency_mode": self.light.emergency_mode,
+
             "queues": self.queues,
             "arrival_rate": self.arrival_rate,
             "emergency": self.emergency,
@@ -54,8 +81,8 @@ class Intersection:
         if kind == "emergency":
             if approach_or_phase in self.emergency:
                 self.emergency[approach_or_phase] = True
+
         elif kind == "ped":
-            # accept "NS" or "EW" as phase requests
             if approach_or_phase == "NS":
                 self.ped["N"] = True
                 self.ped["S"] = True
@@ -64,7 +91,6 @@ class Intersection:
                 self.ped["W"] = True
 
     def clear_served_ped(self):
-        # clear ped requests on currently served phase after it completes a green
         for a in PHASE_SERVES[self.light.phase]:
             self.ped[a] = False
 
@@ -73,82 +99,140 @@ class Intersection:
             if rng.random() < r * SIM_DT:
                 self.queues[a] += 1
 
-    def service_step(self, rng: np.random.Generator) -> int:
+    def any_emergency_active(self) -> bool:
+        return any(self.emergency.values())
+
+    def service_step(self, rng: np.random.Generator) -> Dict[str, int]:
+        """
+        Serve vehicles for this step.
+        - If in_transition: nobody moves.
+        - If emergency_mode: ONLY emergency direction is served (priority),
+          and when emergency clears, we end emergency_mode and force a re-decision.
+        - Otherwise: normal stochastic service for current phase.
+        """
         if self.light.in_transition:
-            return 0
-        moved = 0
+            return {"N": 0, "S": 0, "E": 0, "W": 0}
+
+        moved = {"N": 0, "S": 0, "E": 0, "W": 0}
+
+        # ✅ Emergency mode: serve only emergency approaches (priority)
+        if self.light.emergency_mode:
+            served_apps = PHASE_SERVES[self.light.phase]
+
+            # serve emergency approach(es) first, deterministic 1 vehicle per step if present
+            for a in served_apps:
+                if self.emergency.get(a, False) and self.queues[a] > 0:
+                    self.queues[a] -= 1
+                    moved[a] += 1
+
+                    # emergency clears when its approach queue becomes 0
+                    if self.queues[a] == 0:
+                        self.emergency[a] = False
+
+            # if no emergency remains, exit emergency_mode and force controller decision
+            if not self.any_emergency_active():
+                self.light.emergency_mode = False
+                self.light.time_left = 0  # force controller to decide immediately next tick
+
+            return moved
+
+        # ✅ Normal mode service
         served_apps = PHASE_SERVES[self.light.phase]
         for a in served_apps:
             if self.queues[a] > 0:
                 p = (SERVICE_RATE * self.capacity_mult) * SIM_DT
                 if rng.random() < p:
                     self.queues[a] -= 1
-                    moved += 1
-                    # if emergency on this approach and queue cleared, mark passed
+                    moved[a] += 1
+
+                    # if emergency flag existed and queue cleared (rare outside emergency_mode), clear it
                     if self.emergency[a] and self.queues[a] == 0:
                         self.emergency[a] = False
+
         return moved
 
     def tick_signal(self):
+        # during yellow/all-red transition
         if self.light.in_transition:
             self.light.transition_left -= 1
             if self.light.transition_left <= 0:
                 self.light.in_transition = False
                 self.light.phase = self.light.next_phase or self.light.phase
                 self.light.next_phase = None
-                # after switching, ensure there's a green window
-                # (time_left already set by controller)
-        else:
-            self.light.time_left -= 1
-            if self.light.time_left <= 0:
-                # if controller doesn't update, just keep min green
-                self.light.time_left = MIN_GREEN
-                self.clear_served_ped()
+            return
 
-    def apply_control(self, phase: str, green_for: int, reason: str = ""):
+        # normal green countdown
+        if self.light.time_left > 0:
+            self.light.time_left -= 1
+
+        # green ended
+        if self.light.time_left == 0:
+            self.clear_served_ped()
+
+    def apply_control(self, phase: str, green_for: int, reason: str = "", emergency_preempt: bool = False):
+        """
+        emergency_preempt=True:
+          - skip yellow and do ALL_RED only, then switch to phase
+          - mark emergency_mode=True so emergency vehicles get priority service
+        """
         if self.light.in_transition:
             return
+
+        # if switching phase, start transition window
         if phase != self.light.phase:
-            # start transition
             self.light.in_transition = True
-            self.light.transition_left = YELLOW + ALL_RED
+
+            # ✅ emergency preempt: ALL_RED only (no yellow)
+            self.light.transition_left = (ALL_RED if emergency_preempt else (YELLOW + ALL_RED))
             self.light.next_phase = phase
-            # set the green window that will apply after transition completes
+
+            # time_left counts after transition completes
             self.light.time_left = green_for
+
+            # mark emergency mode if needed (will become active once phase switches)
+            self.light.emergency_mode = bool(emergency_preempt)
+
         else:
+            # same phase: adjust remaining green
             self.light.time_left = green_for
+            # if you called apply_control with emergency_preempt on same phase, still allow emergency mode
+            if emergency_preempt:
+                self.light.emergency_mode = True
+
         self.last_decision_reason = reason
+
 
 class CitySim:
     def __init__(self, sim_name: str, mode: str, scenario: str, seed: int, auto_events: bool = True):
         self.sim_name = sim_name
-        self.mode = mode  # "fixed" or "dynamic"
+        self.mode = mode
         self.scenario = scenario
         self.rng = np.random.default_rng(seed)
         self.t = 0
         self.metrics = Metrics()
+        self.auto_events = auto_events
 
         rates = SCENARIOS[scenario]
         self.intersections: Dict[str, Intersection] = {
-            iid: Intersection(iid, rates[iid]) for iid in ["A","B","C","D"]
+            iid: Intersection(iid, rates[iid]) for iid in ["A", "B", "C", "D"]
         }
 
-        # interdependency mapping: vehicles served on A(EW) move to B, etc.
-        self.corridor = [("A","B"), ("B","C"), ("C","D")]
-
-        self.auto_events = auto_events
-
-        # fixed controller state
+        # fixed timing
         self.fixed_cycle = 60
         self.fixed_ns = 30
         self.fixed_ew = 30
 
-        # for accident scenario: reduce capacity at B on EW
         if scenario == "accident_eastbound":
             self.intersections["B"].capacity_mult = 0.45
 
     def set_scenario(self, scenario: str):
-        self.__init__(self.sim_name, self.mode, scenario, seed=int(self.rng.integers(1, 1_000_000)), auto_events=self.auto_events)
+        self.__init__(
+            self.sim_name,
+            self.mode,
+            scenario,
+            seed=int(self.rng.integers(1, 1_000_000)),
+            auto_events=self.auto_events,
+        )
 
     def inject_event(self, intersection_id: str, kind: str, where: str):
         if intersection_id in self.intersections:
@@ -157,22 +241,21 @@ class CitySim:
     def maybe_auto_events(self):
         if not self.auto_events:
             return
-        # Every ~80-140 seconds spawn a pedestrian request somewhere
+
         if self.t > 0 and self.t % int(self.rng.integers(80, 140)) == 0:
-            iid = self.rng.choice(["A","B","C","D"])
-            phase = self.rng.choice(["NS","EW"])
+            iid = self.rng.choice(["A", "B", "C", "D"])
+            phase = self.rng.choice(["NS", "EW"])
             self.inject_event(iid, "ped", phase)
-        # Every ~120-200 seconds spawn an emergency on a random approach
+
         if self.t > 0 and self.t % int(self.rng.integers(120, 200)) == 0:
-            iid = self.rng.choice(["A","B","C","D"])
-            approach = self.rng.choice(["N","S","E","W"])
+            iid = self.rng.choice(["A", "B", "C", "D"])
+            approach = self.rng.choice(["N", "S", "E", "W"])
             self.inject_event(iid, "emergency", approach)
 
-    def downstream_queues(self, iid: str) -> Dict[str,int]:
-        # simple downstream view: corridor effect on E/W
-        down = {"N":0,"S":0,"E":0,"W":0}
+    def downstream_queues(self, iid: str) -> Dict[str, int]:
+        down = {"N": 0, "S": 0, "E": 0, "W": 0}
         if iid == "A":
-            down["E"] = self.intersections["B"].queues["W"]  # treat B west incoming as downstream
+            down["E"] = self.intersections["B"].queues["W"]
         if iid == "B":
             down["E"] = self.intersections["C"].queues["W"]
             down["W"] = self.intersections["A"].queues["E"]
@@ -183,61 +266,85 @@ class CitySim:
             down["W"] = self.intersections["C"].queues["E"]
         return down
 
-    def controller_tick(self):
-        if self.mode == "fixed":
-            # alternate by cycle
-            cycle_pos = self.t % self.fixed_cycle
-            for inter in self.intersections.values():
-                desired = "NS" if cycle_pos < self.fixed_ns else "EW"
-                # keep a stable green window; ignore downstream
-                inter.apply_control(desired, green_for=MIN_GREEN if inter.light.in_transition else max(10, min(30, inter.light.time_left)), reason="fixed schedule")
-        else:
-            for iid, inter in self.intersections.items():
-                down = self.downstream_queues(iid)
-                phase, green, reason = choose_phase(inter.queues, down, inter.emergency, inter.ped)
-                inter.apply_control(phase, green, reason=reason)
+    def controller_tick_fixed(self):
+        offsets = {"A": 0, "B": 10, "C": 20, "D": 30}
+
+        for iid, inter in self.intersections.items():
+            if inter.light.in_transition or inter.light.time_left != 0:
+                continue
+
+            cycle_pos = (self.t + offsets.get(iid, 0)) % self.fixed_cycle
+            desired = "NS" if cycle_pos < self.fixed_ns else "EW"
+            inter.apply_control(desired, green_for=MIN_GREEN, reason="fixed schedule")
+
+    def controller_tick_dynamic(self):
+        """
+        ✅ Correct per-intersection dynamic control:
+        - Normal: decide only when green ended (time_left==0)
+        - Emergency: decide immediately even mid-green (preempt)
+        """
+        for iid, inter in self.intersections.items():
+            if inter.light.in_transition:
+                continue
+
+            emergency_active = inter.any_emergency_active()
+
+            # Normal: decide only when green finished
+            # Emergency: decide immediately (even mid-green)
+            if (not emergency_active) and (inter.light.time_left != 0):
+                continue
+
+            down = self.downstream_queues(iid)
+
+            phase, green, reason, is_emergency = choose_phase(
+                inter.queues,
+                down,
+                inter.emergency,
+                inter.ped,
+                current_phase=inter.light.phase,
+            )
+
+            inter.apply_control(
+                phase,
+                green_for=green,
+                reason=reason,
+                emergency_preempt=is_emergency,
+            )
 
     def step(self) -> Dict:
         self.t += 1
 
-        # auto events
         self.maybe_auto_events()
 
-        # arrivals
         for inter in self.intersections.values():
             inter.arrivals_step(self.rng)
 
-        # service + movement
         moved_total = 0
-
-        # Serve each intersection, then push some vehicles downstream along corridor (EW flow)
-        corridor_push = {("A","B"):0, ("B","C"):0, ("C","D"):0}
+        corridor_push = {("A", "B"): 0, ("B", "C"): 0, ("C", "D"): 0}
 
         for iid, inter in self.intersections.items():
-            moved = inter.service_step(self.rng)
+            moved_by_dir = inter.service_step(self.rng)
+            moved = sum(moved_by_dir.values())
             moved_total += moved
 
-            # if EW green, we assume some proportion of served cars are corridor-going.
+            # corridor coupling (eastbound)
             if (not inter.light.in_transition) and inter.light.phase == "EW":
-                # from A/B/C: cars going east, from D: cars going west (ignore for corridor simplicity)
-                if iid in ["A","B","C"]:
-                    # push from E approach as eastbound, also from W approach as westbound
-                    corridor_push[(iid, chr(ord(iid)+1))] = int(max(0, moved * 0.35))
-                # Clear ped after a green finishes naturally (handled in tick_signal when time_left hits 0)
+                if iid in ["A", "B", "C"]:
+                    eastbound_served = moved_by_dir["W"]
+                    corridor_push[(iid, chr(ord(iid) + 1))] = int(max(0, eastbound_served * 0.90))
 
-        # apply corridor interdependency: add to downstream incoming queues
         for (src, dst), count in corridor_push.items():
             if count > 0 and dst in self.intersections:
-                # add as incoming from West at downstream (cars entering from west side)
                 self.intersections[dst].queues["W"] += count
 
-        # tick signals
         for inter in self.intersections.values():
             inter.tick_signal()
 
-        # controller decision every CONTROL_INTERVAL seconds
         if self.t % CONTROL_INTERVAL == 0:
-            self.controller_tick()
+            if self.mode == "fixed":
+                self.controller_tick_fixed()
+            else:
+                self.controller_tick_dynamic()
 
         total_queue = sum(sum(inter.queues.values()) for inter in self.intersections.values())
         self.metrics.record_step(t=self.t, total_queue=total_queue, moved=moved_total, dt=SIM_DT)
@@ -256,25 +363,22 @@ class CitySim:
                 "emissions_g": round(self.metrics.total_emissions_g(), 1),
                 "total_queue": sum(sum(i.queues.values()) for i in self.intersections.values()),
                 "series": {
-                    "t": self.metrics.t_series[-300:],  # last 300 points
+                    "t": self.metrics.t_series[-300:],
                     "avg_wait": self.metrics.wait_series[-300:],
                     "queue": self.metrics.queue_series[-300:],
                     "emissions": self.metrics.emissions_series[-300:],
-                }
+                },
             },
             "intersections": [inter.snapshot() for inter in self.intersections.values()],
         }
 
+
 class TwinCity:
-    """Fixed vs Dynamic with identical random stream fairness."""
     def __init__(self, scenario: str = "normal", seed: int = 42):
         self.seed = seed
         self.scenario = scenario
-        # use two sims with different RNG seeds but we will drive them using the same event plan via shared injections:
-        # fairness comes mainly from same scenario + similar RNG; for strict fairness, you can share arrivals, but we keep it stable & simple.
         self.fixed = CitySim("fixed", "fixed", scenario, seed=seed, auto_events=True)
         self.dynamic = CitySim("dynamic", "dynamic", scenario, seed=seed, auto_events=True)
-
         self.running = False
 
     def set_running(self, running: bool):
@@ -304,19 +408,17 @@ class TwinCity:
         return {"running": True, "fixed": self.fixed.step(), "dynamic": self.dynamic.step()}
 
     def run_compare(self, steps: int = 300) -> Dict:
-        # run offline compare from fresh reset so it's reproducible
         base_seed = self.seed
         f = CitySim("fixed", "fixed", self.scenario, seed=base_seed, auto_events=False)
         d = CitySim("dynamic", "dynamic", self.scenario, seed=base_seed, auto_events=False)
 
-        # deterministic scripted events for fairness
         scripted = [
             (80, "ped", "C", "NS"),
             (140, "emergency", "B", "E"),
             (210, "ped", "A", "EW"),
         ]
 
-        for t in range(1, steps+1):
+        for t in range(1, steps + 1):
             for when, kind, iid, where in scripted:
                 if t == when:
                     f.inject_event(iid, kind, where)
@@ -326,7 +428,8 @@ class TwinCity:
 
         fm = f.metrics
         dm = d.metrics
-        def pct_improve(baseline, improved):
+
+        def pct_improve(baseline: float, improved: float) -> float:
             if baseline == 0:
                 return 0.0
             return round((baseline - improved) / baseline * 100.0, 2)
@@ -350,5 +453,5 @@ class TwinCity:
                 "throughput_increase_pct": round(
                     ((dm.vehicles_served - fm.vehicles_served) / (fm.vehicles_served or 1)) * 100.0, 2
                 ),
-            }
+            },
         }

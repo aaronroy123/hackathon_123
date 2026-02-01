@@ -1,10 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional
 
 from simulator import TwinCity
-from config import SCENARIOS
 
 app = FastAPI(title="Ulta-WOW Traffic Optimizer API")
 
@@ -25,8 +24,8 @@ class ControlRequest(BaseModel):
     seed: Optional[int] = None
 
 class InjectRequest(BaseModel):
-    intersection_id: Literal["A","B","C","D"]
-    kind: Literal["emergency","ped"]
+    intersection_id: str
+    kind: str   # "emergency" | "ped"
     where: str  # emergency: N/S/E/W ; ped: NS/EW
 
 @app.get("/health")
@@ -37,15 +36,10 @@ def health():
 def control(req: ControlRequest):
     if req.seed is not None:
         city.reset(seed=req.seed)
-
     if req.scenario is not None:
-        if req.scenario not in SCENARIOS:
-            raise HTTPException(status_code=400, detail=f"Invalid scenario: {req.scenario}")
         city.set_scenario(req.scenario)
-
     if req.auto_events is not None:
         city.set_auto_events(req.auto_events)
-
     if req.running is not None:
         city.set_running(req.running)
 
@@ -58,12 +52,6 @@ def control(req: ControlRequest):
 
 @app.post("/inject")
 def inject(req: InjectRequest):
-    # Validate where field based on kind
-    if req.kind == "emergency" and req.where not in ["N","S","E","W"]:
-        raise HTTPException(status_code=400, detail="Emergency where must be one of N/S/E/W")
-    if req.kind == "ped" and req.where not in ["NS","EW"]:
-        raise HTTPException(status_code=400, detail="Ped where must be NS or EW")
-
     city.inject_event_both(req.intersection_id, req.kind, req.where)
     return {"ok": True}
 
