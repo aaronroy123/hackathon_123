@@ -15,20 +15,9 @@
     .pill.green { background: rgba(45, 200, 90, 0.15); border-color: rgba(45, 200, 90, 0.35); }
     .pill.red { background: rgba(220, 70, 70, 0.15); border-color: rgba(220, 70, 70, 0.35); }
 
-    /* Junction SVG styling */
-    .vizWrap { width: 720px; max-width:100%; }
-    svg { width:100%; height:auto; display:block; }
-    .road { fill:#0e152c; stroke:#2b3a68; stroke-width:2; }
-    .laneMark { stroke:#2b3a68; stroke-width:2; stroke-dasharray:8 8; opacity:0.8; }
-    .stopLine { stroke:#e8eefc; stroke-width:3; opacity:0.35; }
-    .sig { fill:#a6b7e8; }
-    .sig.green { fill:#2dd05a; }
-    .sig.red { fill:#dc4646; }
+    .vizWrap { width: 980px; max-width:100%; }
+    canvas { width:100%; height:auto; display:block; border-radius:16px; border:1px solid #223055; }
 
-    .car { rx:4; ry:4; }
-    .car.in { fill:#6aa5ff; }
-    .car.out { fill:#9fb7ff; opacity:0.6; }
-    .car.emergency { fill:#ffd166; }
     .hud { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px; }
     .stats { display:grid; grid-template-columns: repeat(4, minmax(120px,1fr)); gap:8px; width:100%; margin-top:10px; }
     .stat { background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.06); padding:10px; border-radius:12px; }
@@ -82,47 +71,10 @@
           <div><b>Intersection A (Single Junction View)</b></div>
           <div class="small" id="phaseLine">Phase: -</div>
         </div>
-        <div>
-          <span id="badge" class="pill green">dynamic</span>
-        </div>
+        <div><span id="badge" class="pill green">dynamic</span></div>
       </div>
 
-      <!-- Single cross junction -->
-      <svg id="junction" viewBox="0 0 800 520" aria-label="junction">
-        <!-- Roads (horizontal + vertical) -->
-        <rect class="road" x="0" y="200" width="800" height="120"/>
-        <rect class="road" x="340" y="0" width="120" height="520"/>
-
-        <!-- Lane markings (2 lanes per direction: center divider + lane dividers) -->
-        <!-- Vertical road markings -->
-        <line class="laneMark" x1="400" y1="0" x2="400" y2="520"/>
-        <line class="laneMark" x1="370" y1="0" x2="370" y2="520"/>
-        <line class="laneMark" x1="430" y1="0" x2="430" y2="520"/>
-
-        <!-- Horizontal road markings -->
-        <line class="laneMark" x1="0" y1="260" x2="800" y2="260"/>
-        <line class="laneMark" x1="0" y1="230" x2="800" y2="230"/>
-        <line class="laneMark" x1="0" y1="290" x2="800" y2="290"/>
-
-        <!-- Stop lines (just before junction box) -->
-        <line class="stopLine" x1="340" y1="195" x2="460" y2="195"/> <!-- North stop -->
-        <line class="stopLine" x1="340" y1="325" x2="460" y2="325"/> <!-- South stop -->
-        <line class="stopLine" x1="335" y1="200" x2="335" y2="320"/> <!-- West stop -->
-        <line class="stopLine" x1="465" y1="200" x2="465" y2="320"/> <!-- East stop -->
-
-        <!-- Signal lights (NS pair + EW pair) -->
-        <circle id="sigNS" class="sig" cx="490" cy="175" r="10"></circle>
-        <circle id="sigEW" class="sig" cx="490" cy="345" r="10"></circle>
-
-        <!-- Cars group (we will draw cars here) -->
-        <g id="cars"></g>
-
-        <!-- Labels -->
-        <text x="380" y="20" fill="#b6c4ee" font-size="14">N</text>
-        <text x="380" y="510" fill="#b6c4ee" font-size="14">S</text>
-        <text x="10" y="270" fill="#b6c4ee" font-size="14">W</text>
-        <text x="780" y="270" fill="#b6c4ee" font-size="14">E</text>
-      </svg>
+      <canvas id="junctionCanvas" width="1000" height="600"></canvas>
 
       <div class="stats">
         <div class="stat"><b id="qN">N-IN: 0</b><span class="small">cars waiting</span></div>
@@ -136,76 +88,436 @@
   </div>
 
 <script>
+/* =========================================================
+   Backend config
+========================================================= */
 const API = "http://localhost:8000";
 let timer = null;
-let currentMode = "dynamic"; // "fixed" or "dynamic"
+let currentMode = "dynamic";
 
-// draw cars from queue values (IN lanes only)
-function drawCars(q, emergencyDir) {
-  const carsG = document.getElementById("cars");
-  carsG.innerHTML = "";
+/* Must match backend config.py */
+const YELLOW_SEC = 2;
+const ALL_RED_SEC = 1;
 
-  const cap = (n) => Math.max(0, Math.min(10, n)); // max 10 cars per approach
-  const N = cap(q.N), S = cap(q.S), E = cap(q.E), W = cap(q.W);
+/* =========================================================
+   Canvas setup
+========================================================= */
+const canvas = document.getElementById("junctionCanvas");
+const ctx = canvas.getContext("2d");
 
-  // Geometry: IN lanes positions (two lanes per road: IN + OUT)
-  // We'll draw IN lane cars near stop line, stacking backwards.
-  const spacing = 22;
-
-  // North IN lane (coming down): x=385 lane, y increases towards stop line at ~195
-  for (let i=0; i<N; i++) {
-    const x = 378, y = 40 + i*spacing;
-    addCar(x, y, 18, 26, "N", emergencyDir==="N");
-  }
-  // South IN lane (coming up): x=408 lane, y decreases towards stop line at ~325
-  for (let i=0; i<S; i++) {
-    const x = 408, y = 470 - i*spacing;
-    addCar(x, y, 18, 26, "S", emergencyDir==="S");
-  }
-  // East IN lane (coming left): y=278 lane, x decreases towards stop line at ~465
-  for (let i=0; i<E; i++) {
-    const x = 740 - i*spacing, y = 278;
-    addCar(x, y, 26, 18, "E", emergencyDir==="E");
-  }
-  // West IN lane (coming right): y=248 lane, x increases towards stop line at ~335
-  for (let i=0; i<W; i++) {
-    const x = 40 + i*spacing, y = 248;
-    addCar(x, y, 26, 18, "W", emergencyDir==="W");
-  }
-
-  function addCar(x,y,w,h,dir,isEmer) {
-    const r = document.createElementNS("http://www.w3.org/2000/svg","rect");
-    r.setAttribute("x", x);
-    r.setAttribute("y", y);
-    r.setAttribute("width", w);
-    r.setAttribute("height", h);
-    r.setAttribute("class", `car in${isEmer ? " emergency":""}`);
-    r.setAttribute("data-dir", dir);
-    carsG.appendChild(r);
+function resizeCanvasToDisplaySize() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.floor(rect.width * dpr);
+  const h = Math.floor((rect.width * 0.6) * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
   }
 }
+window.addEventListener("resize", resizeCanvasToDisplaySize);
+resizeCanvasToDisplaySize();
 
-function setSignals(phase, inTransition) {
-  const sigNS = document.getElementById("sigNS");
-  const sigEW = document.getElementById("sigEW");
-  sigNS.classList.remove("green","red");
-  sigEW.classList.remove("green","red");
+/* =========================================================
+   Visual simulation state (frontend-only)
+========================================================= */
+const VIS = {
+  inter: null,
+  cars: { N: [], S: [], E: [], W: [] },
+  lastTs: performance.now(),
+  maxCarsPerDir: 30,
 
-  // During transition -> all red
-  if (inTransition) {
-    sigNS.classList.add("red");
-    sigEW.classList.add("red");
-    return;
+  spacing: 32,
+  followSpeed: 260,
+  passAdvance: 30,
+
+  carLen: 30,
+  carWid: 16,
+
+  flowOffset: { N:0, S:0, E:0, W:0 },
+
+  emergency: {
+    activeDir: null,      // "N"|"S"|"E"|"W"|null
+    allRedUntilMs: 0,
   }
-  if (phase === "NS") {
-    sigNS.classList.add("green");
-    sigEW.classList.add("red");
+};
+
+function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
+
+function pickCarColor() {
+  const colors = ["#6aa5ff","#2dd05a","#ff6b6b","#ffd166","#a78bfa","#22d3ee"];
+  return colors[Math.floor(Math.random()*colors.length)];
+}
+
+function makeCar(dir, lane) {
+  return { dir, lane, x:0, y:0, color: pickCarColor() };
+}
+
+/* =========================================================
+   Emergency detection (from backend)
+========================================================= */
+function getEmergencyDir(inter){
+  if (!inter || !inter.emergency) return null;
+  for (const k of Object.keys(inter.emergency)) {
+    if (inter.emergency[k]) return k;
+  }
+  return null;
+}
+
+function emergencyAxis(dir){
+  if (!dir) return null;
+  return (dir === "N" || dir === "S") ? "NS" : "EW";
+}
+
+/* =========================================================
+   Traffic light state: green / yellow / red + emergency override
+========================================================= */
+function baseLightStateForAxis(axis, inter){
+  if (!inter) return "red";
+
+  if (!inter.in_transition) {
+    return (inter.phase === axis) ? "green" : "red";
+  }
+
+  const tr = Number(inter.transition_left ?? 0);
+  if (tr > ALL_RED_SEC) return "yellow";
+  return "red";
+}
+
+/**
+ * Emergency override:
+ * - Emergency start -> show ALL RED for ALL_RED_SEC (visual clearance)
+ * - Then show GREEN only on emergency axis, other axis RED
+ * - If backend is still in_transition, keep RED (smoother & accurate)
+ */
+function lightStateForAxis(axis, inter){
+  const now = performance.now();
+  const edir = VIS.emergency.activeDir;
+
+  if (edir) {
+    if (!inter) return "red";
+
+    // if backend is still transitioning, stay red
+    if (inter.in_transition) return "red";
+
+    // clearance all-red window
+    if (now < VIS.emergency.allRedUntilMs) return "red";
+
+    // after clearance: only emergency axis green
+    const eAxis = emergencyAxis(edir);
+    return (axis === eAxis) ? "green" : "red";
+  }
+
+  return baseLightStateForAxis(axis, inter);
+}
+
+function isGreen(dir, inter) {
+  if (VIS.emergency.activeDir) {
+    const axis = emergencyAxis(VIS.emergency.activeDir);
+    return (axis === "NS" && (dir === "N" || dir === "S")) ||
+           (axis === "EW" && (dir === "E" || dir === "W"));
+  }
+
+  if (!inter) return false;
+  if (inter.in_transition) return false;
+  if ((dir === "N" || dir === "S") && inter.phase === "NS") return true;
+  if ((dir === "E" || dir === "W") && inter.phase === "EW") return true;
+  return false;
+}
+
+/* =========================================================
+   Road geometry (lane centers prevent overlap)
+========================================================= */
+function roadGeom(){
+  const W = canvas.width, H = canvas.height;
+  const cx = W/2, cy = H/2;
+  const roadW = Math.min(W,H) * 0.26;
+  const laneSep = roadW * 0.18;
+  const stopDist = roadW * 0.55;
+  return {W,H,cx,cy,roadW,laneSep,stopDist};
+}
+
+function laneCenter(dir, lane){
+  const {cx,cy,laneSep} = roadGeom();
+  const s = (lane === 0 ? -laneSep : +laneSep);
+
+  if (dir === "N" || dir === "S") return { x: cx + s, y: null };
+  if (dir === "E" || dir === "W") return { x: null, y: cy + s };
+  return {x:cx,y:cy};
+}
+
+function stopLine(dir, lane) {
+  const {cx,cy,stopDist} = roadGeom();
+  const lc = laneCenter(dir, lane);
+
+  if (dir === "N") return { x: lc.x, y: cy - stopDist };
+  if (dir === "S") return { x: lc.x, y: cy + stopDist };
+  if (dir === "E") return { x: cx + stopDist, y: lc.y };
+  return { x: cx - stopDist, y: lc.y };
+}
+
+function placeCarAtBack(car, dir, indexInLane) {
+  const {W,H,cx,cy} = roadGeom();
+  const s = VIS.spacing;
+  const far = 0.48;
+
+  if (dir === "N") { car.x = laneCenter(dir, car.lane).x; car.y = (cy - H*far) + indexInLane*s; }
+  if (dir === "S") { car.x = laneCenter(dir, car.lane).x; car.y = (cy + H*far) - indexInLane*s; }
+  if (dir === "E") { car.y = laneCenter(dir, car.lane).y; car.x = (cx + W*far) - indexInLane*s; }
+  if (dir === "W") { car.y = laneCenter(dir, car.lane).y; car.x = (cx - W*far) + indexInLane*s; }
+}
+
+/* =========================================================
+   Reconcile cars with backend queues
+========================================================= */
+function reconcileCars(inter) {
+  if (!inter) return;
+  const q = inter.queues;
+
+  ["N","S","E","W"].forEach(dir => {
+    const target = clamp(q[dir], 0, VIS.maxCarsPerDir);
+    const arr = VIS.cars[dir];
+
+    while (arr.length < target) {
+      const lane = (arr.length % 2);
+      const c = makeCar(dir, lane);
+      const idxLane = Math.floor(arr.length / 2);
+      placeCarAtBack(c, dir, idxLane);
+      arr.push(c);
+    }
+
+    while (arr.length > target) arr.pop();
+  });
+}
+
+/* =========================================================
+   Movement
+========================================================= */
+function updateFlowOffset(dt, inter) {
+  ["N","S","E","W"].forEach(dir => {
+    if (isGreen(dir, inter)) {
+      VIS.flowOffset[dir] += VIS.passAdvance * dt;
+    } else {
+      VIS.flowOffset[dir] *= 0.80;
+      if (Math.abs(VIS.flowOffset[dir]) < 0.3) VIS.flowOffset[dir] = 0;
+    }
+    VIS.flowOffset[dir] = clamp(VIS.flowOffset[dir], 0, VIS.spacing);
+  });
+}
+
+function targetPosition(dir, lane, orderInLane) {
+  const stop = stopLine(dir, lane);
+  let tx = stop.x, ty = stop.y;
+  const off = VIS.flowOffset[dir];
+
+  if (dir === "N") { ty -= orderInLane * VIS.spacing; ty += off; }
+  if (dir === "S") { ty += orderInLane * VIS.spacing; ty -= off; }
+  if (dir === "E") { tx += orderInLane * VIS.spacing; tx -= off; }
+  if (dir === "W") { tx -= orderInLane * VIS.spacing; tx += off; }
+
+  return {tx, ty};
+}
+
+function moveToward(car, tx, ty, speed, dt) {
+  const dx = tx - car.x;
+  const dy = ty - car.y;
+  const d = Math.hypot(dx,dy) || 1;
+  const step = Math.min(d, speed * dt);
+  car.x += (dx/d) * step;
+  car.y += (dy/d) * step;
+}
+
+function updateCars(dt, inter) {
+  if (!inter) return;
+
+  updateFlowOffset(dt, inter);
+
+  ["N","S","E","W"].forEach(dir => {
+    const lane0 = VIS.cars[dir].filter(c => c.lane === 0);
+    const lane1 = VIS.cars[dir].filter(c => c.lane === 1);
+
+    const stop0 = stopLine(dir, 0);
+    const stop1 = stopLine(dir, 1);
+
+    lane0.sort((a,b)=>Math.hypot(a.x-stop0.x,a.y-stop0.y)-Math.hypot(b.x-stop0.x,b.y-stop0.y));
+    lane1.sort((a,b)=>Math.hypot(a.x-stop1.x,a.y-stop1.y)-Math.hypot(b.x-stop1.x,b.y-stop1.y));
+
+    for (let i=0;i<lane0.length;i++){
+      const {tx,ty} = targetPosition(dir, 0, i);
+      moveToward(lane0[i], tx, ty, VIS.followSpeed, dt);
+    }
+    for (let i=0;i<lane1.length;i++){
+      const {tx,ty} = targetPosition(dir, 1, i);
+      moveToward(lane1[i], tx, ty, VIS.followSpeed, dt);
+    }
+  });
+}
+
+/* =========================================================
+   Drawing
+========================================================= */
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x+r, y);
+  c.arcTo(x+w, y,   x+w, y+h, r);
+  c.arcTo(x+w, y+h, x,   y+h, r);
+  c.arcTo(x,   y+h, x,   y,   r);
+  c.arcTo(x,   y,   x+w, y,   r);
+  c.closePath();
+}
+
+function drawRoads() {
+  const {W,H,cx,cy,roadW,laneSep,stopDist} = roadGeom();
+
+  ctx.fillStyle = "#0b0f1a";
+  ctx.fillRect(0,0,W,H);
+
+  ctx.fillStyle = "#0e152c";
+  ctx.strokeStyle = "rgba(120,150,240,0.25)";
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+  roundRect(ctx, cx - W*0.48, cy - roadW/2, W*0.96, roadW, 18);
+  ctx.fill(); ctx.stroke();
+
+  ctx.beginPath();
+  roundRect(ctx, cx - roadW/2, cy - H*0.48, roadW, H*0.96, 18);
+  ctx.fill(); ctx.stroke();
+
+  ctx.setLineDash([10,10]);
+  ctx.strokeStyle = "rgba(160,190,255,0.22)";
+  ctx.lineWidth = 2;
+
+  ctx.beginPath(); ctx.moveTo(cx - W*0.48, cy); ctx.lineTo(cx + W*0.48, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - H*0.48); ctx.lineTo(cx, cy + H*0.48); ctx.stroke();
+
+  ctx.beginPath(); ctx.moveTo(cx - W*0.48, cy - laneSep); ctx.lineTo(cx + W*0.48, cy - laneSep); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - W*0.48, cy + laneSep); ctx.lineTo(cx + W*0.48, cy + laneSep); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - laneSep, cy - H*0.48); ctx.lineTo(cx - laneSep, cy + H*0.48); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + laneSep, cy - H*0.48); ctx.lineTo(cx + laneSep, cy + H*0.48); ctx.stroke();
+
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = "rgba(240,250,255,0.35)";
+  ctx.lineWidth = 4;
+
+  ctx.beginPath(); ctx.moveTo(cx-roadW/2, cy-stopDist); ctx.lineTo(cx+roadW/2, cy-stopDist); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-roadW/2, cy+stopDist); ctx.lineTo(cx+roadW/2, cy+stopDist); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-stopDist, cy-roadW/2); ctx.lineTo(cx-stopDist, cy+roadW/2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx+stopDist, cy-roadW/2); ctx.lineTo(cx+stopDist, cy+roadW/2); ctx.stroke();
+}
+
+function drawLights(inter) {
+  if (!inter) return;
+  const {cx,cy,stopDist} = roadGeom();
+
+  const nsState = lightStateForAxis("NS", inter);
+  const ewState = lightStateForAxis("EW", inter);
+
+  function colorFor(state){
+    if (state === "green") return "#2dd05a";
+    if (state === "yellow") return "#ffd166";
+    return "#dc4646";
+  }
+
+  function bulb(x,y,state){
+    ctx.fillStyle = colorFor(state);
+    ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle="rgba(0,0,0,0.45)";
+    ctx.lineWidth=2; ctx.stroke();
+  }
+
+  bulb(cx, cy - stopDist*0.72, nsState);
+  bulb(cx, cy + stopDist*0.72, nsState);
+  bulb(cx + stopDist*0.72, cy, ewState);
+  bulb(cx - stopDist*0.72, cy, ewState);
+
+  const edir = VIS.emergency.activeDir;
+  ctx.fillStyle="#e8eefc";
+  ctx.font = `${Math.floor(16*(canvas.width/1000))}px system-ui`;
+
+  if (edir) {
+    ctx.fillText(`EMERGENCY ${edir} | Override active`, 18, 30);
   } else {
-    sigNS.classList.add("red");
-    sigEW.classList.add("green");
+    ctx.fillText(`NS: ${nsState.toUpperCase()}  |  EW: ${ewState.toUpperCase()}`, 18, 30);
   }
 }
 
+function drawCarSprite(car, emergencyDir) {
+  const w = VIS.carLen * (canvas.width/1000);
+  const h = VIS.carWid * (canvas.width/1000);
+
+  let ang = 0;
+  if (car.dir === "N") ang = Math.PI/2;
+  if (car.dir === "S") ang = -Math.PI/2;
+  if (car.dir === "E") ang = Math.PI;
+  if (car.dir === "W") ang = 0;
+
+  const isEmer = (emergencyDir === car.dir);
+
+  ctx.save();
+  ctx.translate(car.x, car.y);
+  ctx.rotate(ang);
+
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  roundRect(ctx, -w/2+2, -h/2+2, w, h, 5);
+  ctx.fill();
+
+  ctx.fillStyle = isEmer ? "#ffd166" : car.color;
+  roundRect(ctx, -w/2, -h/2, w, h, 5);
+  ctx.fill();
+
+  ctx.fillStyle = "rgba(10,20,40,0.65)";
+  roundRect(ctx, -w/2+6, -h/2+3, w-12, h-6, 3);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawCars(inter) {
+  const emergencyDir = getEmergencyDir(inter);
+  ["N","S","E","W"].forEach(dir => {
+    for (const car of VIS.cars[dir]) drawCarSprite(car, emergencyDir);
+  });
+}
+
+function renderFrame(ts) {
+  resizeCanvasToDisplaySize();
+  const dt = Math.min(0.05, (ts - VIS.lastTs) / 1000);
+  VIS.lastTs = ts;
+
+  drawRoads();
+  if (VIS.inter) {
+    updateCars(dt, VIS.inter);
+    drawLights(VIS.inter);
+    drawCars(VIS.inter);
+  }
+  requestAnimationFrame(renderFrame);
+}
+requestAnimationFrame(renderFrame);
+
+function updateFromBackend(intersectionSnapshot) {
+  const newDir = getEmergencyDir(intersectionSnapshot);
+  const oldDir = VIS.emergency.activeDir;
+
+  if (newDir && !oldDir) {
+    VIS.emergency.activeDir = newDir;
+    VIS.emergency.allRedUntilMs = performance.now() + (ALL_RED_SEC * 1000);
+  } else if (!newDir && oldDir) {
+    VIS.emergency.activeDir = null;
+    VIS.emergency.allRedUntilMs = 0;
+  } else if (newDir && oldDir && newDir !== oldDir) {
+    VIS.emergency.activeDir = newDir;
+    VIS.emergency.allRedUntilMs = performance.now() + (ALL_RED_SEC * 1000);
+  }
+
+  VIS.inter = intersectionSnapshot;
+  reconcileCars(VIS.inter);
+}
+
+/* =========================================================
+   API + UI
+========================================================= */
 async function api(method, path, body=null) {
   const opts = { method, headers: {"Content-Type":"application/json"} };
   if (body) opts.body = JSON.stringify(body);
@@ -227,25 +539,23 @@ async function tickOnce() {
   document.getElementById("badge").className = "pill " + (currentMode==="dynamic" ? "green":"red");
 
   document.getElementById("phaseLine").textContent =
-    `Phase: ${A.phase} | time left: ${A.time_left}s ${A.in_transition ? "(transition)" : ""}`;
+    `Phase: ${A.phase} | time left: ${A.time_left}s ${A.in_transition ? "(transition)" : ""}` +
+    (A.in_transition ? ` | transition_left: ${A.transition_left ?? "-"}` : "");
 
   document.getElementById("reasonLine").textContent = `Reason: ${A.reason || "-"}`;
 
-  document.getElementById("qN").textContent = `N-IN: ${q.N}`;
-  document.getElementById("qS").textContent = `S-IN: ${q.S}`;
-  document.getElementById("qE").textContent = `E-IN: ${q.E}`;
-  document.getElementById("qW").textContent = `W-IN: ${q.W}`;
+  // ✅ safer queue access
+  document.getElementById("qN").textContent = `N-IN: ${q["N"]}`;
+  document.getElementById("qS").textContent = `S-IN: ${q["S"]}`;
+  document.getElementById("qE").textContent = `E-IN: ${q["E"]}`;
+  document.getElementById("qW").textContent = `W-IN: ${q["W"]}`;
 
-  setSignals(A.phase, A.in_transition);
-
-  // Show emergency highlight on the approach if active
-  const emergencyDir = (A.emergency && Object.keys(A.emergency).find(k => A.emergency[k])) || null;
-  drawCars(q, emergencyDir);
+  updateFromBackend(A);
 }
 
 function startLoop() {
   if (timer) return;
-  timer = setInterval(tickOnce, 800);
+  timer = setInterval(tickOnce, 900);
 }
 function stopLoop() {
   if (!timer) return;
@@ -257,11 +567,13 @@ document.getElementById("btnStart").onclick = async () => {
   await api("POST","/control",{running:true});
   startLoop();
 };
+
 document.getElementById("btnPause").onclick = async () => {
   await api("POST","/control",{running:false});
   stopLoop();
   await tickOnce();
 };
+
 document.getElementById("btnReset").onclick = async () => {
   await api("POST","/control",{seed: 42});
   await tickOnce();
@@ -286,10 +598,12 @@ document.getElementById("btnEmergency").onclick = async () => {
   await api("POST","/inject",{intersection_id:"A", kind:"emergency", where});
   await tickOnce();
 };
+
 document.getElementById("btnPedNS").onclick = async () => {
   await api("POST","/inject",{intersection_id:"A", kind:"ped", where:"NS"});
   await tickOnce();
 };
+
 document.getElementById("btnPedEW").onclick = async () => {
   await api("POST","/inject",{intersection_id:"A", kind:"ped", where:"EW"});
   await tickOnce();
